@@ -1,0 +1,9 @@
+build/
+cmake-build-debug/
+.idea/
+results/
+.DS_Store
+.visualize.py
+*.o
+*.a
+*.so
