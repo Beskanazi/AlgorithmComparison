@@ -213,15 +213,16 @@ static void save_partition(const char *graph_base, const char *algorithm,
 }
 
 
-static int find_best_k(const Graph *g, int seed, bool use_xcut, int search_iters, int louvain_k) {
-    // Use Louvain's k as anchor for search range
+static int find_best_k(const Graph *g, int seed, bool use_xcut,
+                        int search_iters, int louvain_k,
+                        const char *graph_name) {
     int anchor = louvain_k > 0 ? louvain_k : (int)sqrt((double)g->n_nodes);
     int min_k  = anchor / 2 > 2 ? anchor / 2 : 2;
     int max_k  = anchor * 3 / 2;
     int step   = (max_k - min_k) > 10 ? (max_k - min_k) / 5 : 2;
+    //int step = 2;
     if (step < 1) step = 1;
 
-    // Scale search iterations for K-Medoids
     if      (g->n_nodes > 10000) search_iters = 3;
     else if (g->n_nodes > 5000)  search_iters = 5;
     else if (g->n_nodes > 2000)  search_iters = 10;
@@ -229,8 +230,8 @@ static int find_best_k(const Graph *g, int seed, bool use_xcut, int search_iters
     printf("  Searching best k (%s) in [%d, %d] step %d (anchor=%d)...\n",
            use_xcut ? "XCut" : "K-Medoids", min_k, max_k, step, anchor);
 
-    int    best_k    = min_k;
-    double best_score = use_xcut ? 1e9 : -1e9;
+    int    best_k     = min_k;
+    double best_score = -1e9;
 
     for (int k = min_k; k <= max_k; k += step) {
         printf("    k=%d...\r", k);
@@ -241,21 +242,28 @@ static int find_best_k(const Graph *g, int seed, bool use_xcut, int search_iters
             : kmedoids_cluster(g, k, search_iters, seed);
         if (!cr) continue;
 
-        if (use_xcut) {
-            double score = compute_ncut(g, cr->labels);
-            if (score < best_score) { best_score = score; best_k = k; }
-        } else {
-            double score = evaluate_silhouette(g, cr->labels, k);
-            if (score > best_score) { best_score = score; best_k = k; }
+        double sil_score  = evaluate_silhouette(g, cr->labels, k);
+        double ncut_score = compute_ncut(g, cr->labels);
+        double mod_score  = compute_modularity_igraph(g, cr->labels, 1.0);
+        double score      = use_xcut ? mod_score : sil_score;
+
+        /* --- logging --- */
+        FILE *log = fopen("results/k_search_log.csv", "a");
+        if (log) {
+            fprintf(log, "%s,%s,%d,%.6f,%.6f,%.6f\n",
+                    graph_name,
+                    use_xcut ? "XCut" : "K-Medoids",
+                    k, sil_score, ncut_score, mod_score);
+            fclose(log);
         }
+
+        if (score > best_score) { best_score = score; best_k = k; }
         free_cluster_result(cr);
     }
 
-    printf("  → Best k = %d (%s = %.4f)\n\n", best_k,
-           use_xcut ? "ncut" : "silhouette", best_score);
+    printf("  -> Best k = %d (score = %.4f)\n\n", best_k, best_score);
     return best_k;
 }
-
 
 
 // ============================================================================
@@ -408,7 +416,7 @@ static void run_graph(const char *graph_file, const char *csv_out, const Config 
     if (should_run("kmedoids", cfg->algorithm)) {
         int k = (cfg->k > 0 && !cfg->find_k)
             ? cfg->k
-            : find_best_k(g, cfg->seed, false, search_iters, louvain_k);
+            : find_best_k(g, cfg->seed, false, search_iters, louvain_k, base);
 
         int kmedoids_iters = g->n_nodes > 10000 ? 20 :
                      g->n_nodes > 5000  ? 30 : cfg->max_iter;
@@ -418,7 +426,7 @@ static void run_graph(const char *graph_file, const char *csv_out, const Config 
     if (should_run("xcut", cfg->algorithm)) {
         int k = (cfg->k > 0 && !cfg->find_k)
             ? cfg->k
-            : find_best_k(g, cfg->seed, true, search_iters, louvain_k);
+            : find_best_k(g, cfg->seed, true, search_iters, louvain_k,base);
         results[count++] = run_xcut(g, base, k, cfg->seed);
     }
 
@@ -447,6 +455,11 @@ int main(int argc, char *argv[]) {
 
     ensure_dir("results");
     ensure_dir("results/partitions");
+    FILE *klog = fopen("results/k_search_log.csv", "w");
+    if (klog) {
+        fprintf(klog, "graph,algorithm,k,silhouette,ncut,modularity\n");
+        fclose(klog);
+    }
 
     //Batch mode
     if (cfg.run_all) {
@@ -467,7 +480,7 @@ int main(int argc, char *argv[]) {
             printf("  [%d] %s\n", i + 1, fl.paths[i]);
         printf("\n");
 
-        const char *csv_out = "results/all_results.csv";
+        const char *csv_out = cfg.output_file ? cfg.output_file : "results/all_results.csv";
         remove(csv_out);  // fresh run each time
 
         for (int i = 0; i < fl.count; i++)
